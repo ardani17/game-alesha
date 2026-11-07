@@ -46,7 +46,7 @@ type UpdState =
   | { status: "ada"; rilis: RilisInfo }
   | { status: "unduh"; pct: number }
   | { status: "pasang" }
-  | { status: "gagal"; msg: string; halaman?: string };
+  | { status: "gagal"; msg: string; halaman?: string; apkUrl?: string };
 
 /** "1.2.0" > "1.1.9"? bandingkan per bagian angka */
 function isNewer(a: string, b: string) {
@@ -158,7 +158,8 @@ export function GameMenu({ onPick }: { onPick: (game: MenuPick) => void }) {
    */
   const perbaruiSekarang = async (rilis: RilisInfo) => {
     if (!Capacitor.isNativePlatform() || !rilis.apkUrl) {
-      await Browser.open({ url: rilis.halaman });
+      // di web: langsung tautan APK (terunduh oleh browser), atau halaman rilis
+      await Browser.open({ url: rilis.apkUrl ?? rilis.halaman });
       return;
     }
     try {
@@ -176,9 +177,27 @@ export function GameMenu({ onPick }: { onPick: (game: MenuPick) => void }) {
       await InstallApk.install({ uri: w.uri });
       // pemasang sistem terbuka; pengguna tinggal konfirmasi "Install"
     } catch {
+      // GitHub tidak mengizinkan CORS untuk berkas rilis, jadi fetch dari
+      // WebView selalu gagal — serahkan ke browser sistem lewat tautan APK
+      // langsung (unduhan browser tidak terkena batas CORS).
+      if (rilis.apkUrl && navigator.onLine) {
+        try {
+          await Browser.open({ url: rilis.apkUrl });
+          setUpd({
+            status: "gagal",
+            msg: "APK sedang diunduh di browser — setelah selesai, buka berkasnya untuk memasang:",
+            apkUrl: rilis.apkUrl,
+            halaman: rilis.halaman,
+          });
+          return;
+        } catch {
+          /* browser gagal dibuka — jatuh ke tautan manual di bawah */
+        }
+      }
       setUpd({
         status: "gagal",
         msg: "Unduhan gagal — periksa koneksi, atau unduh manual:",
+        apkUrl: rilis.apkUrl,
         halaman: rilis.halaman,
       });
     }
@@ -452,18 +471,30 @@ export function GameMenu({ onPick }: { onPick: (game: MenuPick) => void }) {
           )}
           {upd.status === "gagal" && (
             <div className="flex flex-col items-center gap-1">
-              <p className="text-center text-sm font-semibold text-[#c2843c]">
+              <p className="max-w-xs text-center text-sm font-semibold text-[#c2843c]">
                 {upd.msg}
               </p>
-              {upd.halaman && (
-                <button
-                  type="button"
-                  onClick={() => void Browser.open({ url: upd.halaman! })}
-                  className="text-sm font-bold text-[#0284c7] underline"
-                >
-                  Buka halaman rilis
-                </button>
-              )}
+              <div className="flex flex-wrap items-center justify-center gap-3">
+                {upd.apkUrl && (
+                  <motion.button
+                    type="button"
+                    whileTap={{ scale: 0.95 }}
+                    onClick={() => void Browser.open({ url: upd.apkUrl! })}
+                    className="rounded-full bg-[#38BDF8] px-4 py-1.5 text-sm font-extrabold text-white shadow-[0_3px_0_rgba(2,132,199,0.9)] active:translate-y-0.5"
+                  >
+                    ⬇ Unduh APK
+                  </motion.button>
+                )}
+                {upd.halaman && (
+                  <button
+                    type="button"
+                    onClick={() => void Browser.open({ url: upd.halaman! })}
+                    className="text-sm font-bold text-[#0284c7] underline"
+                  >
+                    halaman rilis
+                  </button>
+                )}
+              </div>
             </div>
           )}
         </div>
