@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { motion } from "framer-motion";
-import { BookOpen, Calculator, Palette, RefreshCw, Type } from "lucide-react";
+import { BookOpen, Calculator, Palette, Puzzle, RefreshCw, Type } from "lucide-react";
 import { Browser } from "@capacitor/browser";
 import { Capacitor, registerPlugin } from "@capacitor/core";
 import { Directory, Filesystem } from "@capacitor/filesystem";
@@ -23,7 +23,7 @@ const LETTER_COLORS = [
 
 const TITLE = "Game Alesha";
 
-export type MenuPick = "draw" | "count" | "letters" | "read";
+export type MenuPick = "draw" | "count" | "letters" | "read" | "match";
 
 /* ------------------------ pembaruan otomatis (GitHub) ------------------------ */
 
@@ -355,6 +355,37 @@ export function GameMenu({ onPick }: { onPick: (game: MenuPick) => void }) {
             </div>
             <p className="text-center text-xs font-semibold text-white/95">
               Susun huruf jadi kata
+            </p>
+          </motion.button>
+
+          {/* Menyamakan Gambar (drag gambar ke pasangannya) */}
+          <motion.button
+            type="button"
+            whileHover={{ scale: 1.04, rotate: -1 }}
+            whileTap={{ scale: 0.96 }}
+            onClick={() => pick("match")}
+            aria-label="Menyamakan gambar"
+            className="flex flex-col rounded-3xl border-4 border-white bg-gradient-to-br from-teal-300 via-cyan-300 to-sky-300 p-3 shadow-[0_8px_0_rgba(13,148,136,0.18)]"
+          >
+            <div className="relative grid aspect-square place-items-center rounded-2xl bg-white/35 p-3">
+              <div className="absolute left-1.5 top-2 grid h-14 w-14 -rotate-6 place-items-center rounded-2xl bg-white/90 text-3xl shadow-sm">
+                🐟
+              </div>
+              <div className="absolute -right-0.5 bottom-1.5 grid h-14 w-14 rotate-6 place-items-center rounded-2xl bg-white/90 text-3xl shadow-sm">
+                🐟
+                <span className="absolute -right-1.5 -top-1.5 grid h-5 w-5 place-items-center rounded-full bg-emerald-400 text-[10px] font-extrabold text-white ring-2 ring-white">
+                  ✓
+                </span>
+              </div>
+            </div>
+            <div className="mt-3 flex items-center justify-center gap-1.5">
+              <Puzzle className="h-5 w-5 text-white" strokeWidth={2.4} />
+              <p className="text-lg font-extrabold text-white drop-shadow-md">
+                Menyamakan
+              </p>
+            </div>
+            <p className="text-center text-xs font-semibold text-white/95">
+              Jodohkan gambar yang sama
             </p>
           </motion.button>
         </div>

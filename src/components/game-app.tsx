@@ -5,6 +5,7 @@ import { CountingGame } from "@/components/counting-game";
 import { DrawingApp } from "@/components/drawing-app";
 import { GameMenu, type MenuPick } from "@/components/game-menu";
 import { LettersGame } from "@/components/letters-game";
+import { MatchingGame } from "@/components/matching-game";
 import { ReadingGame } from "@/components/reading-game";
 
 type GameView = "menu" | MenuPick;
@@ -24,6 +25,9 @@ export function GameApp() {
   }
   if (view === "read") {
     return <ReadingGame onExit={() => setView("menu")} />;
+  }
+  if (view === "match") {
+    return <MatchingGame onExit={() => setView("menu")} />;
   }
   return <GameMenu onPick={setView} />;
 }

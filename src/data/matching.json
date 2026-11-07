@@ -1,0 +1,12 @@
+[
+  { "name": "apel", "emoji": "🍎", "audio": "/audio/berhitung/apel.mp3" },
+  { "name": "bintang", "emoji": "⭐", "audio": "/audio/berhitung/bintang.mp3" },
+  { "name": "bebek", "emoji": "🦆", "audio": "/audio/berhitung/bebek.mp3" },
+  { "name": "balon", "emoji": "🎈", "audio": "/audio/berhitung/balon.mp3" },
+  { "name": "ikan", "emoji": "🐟", "audio": "/audio/berhitung/ikan.mp3" },
+  { "name": "bunga", "emoji": "🌸", "audio": "/audio/berhitung/bunga.mp3" },
+  { "name": "mobil", "emoji": "🚗", "audio": "/audio/berhitung/mobil.mp3" },
+  { "name": "beruang", "emoji": "🐻", "audio": "/audio/berhitung/beruang.mp3" },
+  { "name": "pisang", "emoji": "🍌", "audio": "/audio/berhitung/pisang.mp3" },
+  { "name": "kue", "emoji": "🧁", "audio": "/audio/berhitung/kue.mp3" }
+]
