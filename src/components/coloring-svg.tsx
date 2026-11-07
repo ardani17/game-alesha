@@ -5,23 +5,27 @@ import type { ColoringPage } from "@/lib/coloring-pages";
 
 interface Props {
   page: ColoringPage;
-  /** shapeId -> color */
+  /** shapeId -> color (used by the gallery thumbnails) */
   fills?: Record<string, string>;
+  /** render colorable shapes as hollow outlines — the crayon paint lives on a canvas below */
+  outlineOnly?: boolean;
   className?: string;
   strokeWidth?: number;
   title?: string;
 }
 
 /**
- * Renders a coloring page as an SVG. Colorable shapes carry a
- * `data-region` attribute; the parent colors whatever shape is under the
- * child's finger while rubbing (hit-tested with elementFromPoint), so no
- * per-shape click handlers are needed. Decorations (eyes, whiskers, sun
- * rays…) are pointer-transparent and never block the rubbing finger.
+ * Renders a coloring page as an SVG. In thumbnail mode (`fills`) colorable
+ * shapes are painted solid. In coloring mode (`outlineOnly`) they stay hollow
+ * (`fill="none"`) so the crayon strokes on the paint canvas underneath shine
+ * through while the dark outlines stay crisply on top — like a real coloring
+ * book. Decorations (eyes, whiskers, sun rays…) are pointer-transparent and
+ * never block the rubbing finger.
  */
 export function ColoringSvg({
   page,
   fills,
+  outlineOnly = false,
   className,
   strokeWidth = 6,
   title,
@@ -37,7 +41,9 @@ export function ColoringSvg({
         const key = s.id ?? `fix-${i}`;
         const colorable = !!s.colorable && !!s.id;
         const fillColor = colorable
-          ? (fills?.[s.id as string] ?? "#FFFFFF")
+          ? outlineOnly
+            ? "none"
+            : (fills?.[s.id as string] ?? "#FFFFFF")
           : (s.fill ?? "none");
         const props: Record<string, unknown> = {
           ...s.attrs,
@@ -47,11 +53,11 @@ export function ColoringSvg({
           strokeLinejoin: "round",
           strokeLinecap: "round",
         };
-        if (colorable) {
+        if (colorable && !outlineOnly) {
           props["data-region"] = s.id;
           props.style = { fill: fillColor, transition: "fill 260ms ease" };
         } else {
-          // decorations must never block the rubbing finger
+          // decorations (and hollow coloring outlines) must never block the finger
           props.style = { pointerEvents: "none" };
         }
         return React.createElement(s.el, { ...props, key });

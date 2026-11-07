@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import {
   ArrowLeft,
@@ -35,10 +35,14 @@ import {
 /* ---------------------------------- data ---------------------------------- */
 
 /**
- * Everything is colored by RUBBING (gesek-gesek): the child simply sweeps a
- * finger over the picture and every area under it pops into a cheerful
- * random color. No color picking, no tools — zero frustration for a
- * two-year-old. Rubbing an area again changes its color.
+ * Coloring works like a REAL crayon: the picture outlines are a hollow SVG on
+ * top and the color lives on a paint canvas underneath. Every finger sweep
+ * lays down a soft semi-transparent stroke clipped inside the region under
+ * it, so color appears exactly where the child rubs and deepens pass after
+ * pass — never as an instant fill. Regions are detected geometrically
+ * (Path2D hit-testing in reverse paint order), so strokes always stay inside
+ * the lines, and background areas that sit under other shapes paint through
+ * a precomputed mask so they never bleed into the shapes above them.
  */
 
 /** vivid colors for the main shapes */
@@ -92,9 +96,235 @@ type DrawTool = "brush" | "eraser";
 /** hit-test sampling distance (px) while the finger sweeps */
 const RUB_STEP = 14;
 
+/* --------------------------- crayon paint engine --------------------------- */
+
+/** paint canvas resolution — the viewBox is 400, 2× keeps crayon strokes crisp */
+const PAINT_SIZE = 800;
+/** crayon tip width (paint px): overlapping sweeps build up color slowly */
+const BRUSH_W = 34;
+/** each pass lays down a translucent coat, like the pressure of a real pencil */
+const BRUSH_ALPHA = 0.5;
+/** grid used to measure how much of every region is actually painted */
+const CELL_GRID = 50;
+/** a region counts as "colored" once this fraction of its cells hold paint */
+const DONE_RATIO = 0.4;
+/** resolution of the PNG snapshots kept for undo + localStorage */
+const STORE_SIZE = 400;
+/** how many undo snapshots to keep (each holds a small PNG data URL) */
+const UNDO_LIMIT = 10;
+
 function pickRandom(pool: string[], avoid?: string) {
   const options = avoid ? pool.filter((c) => c !== avoid) : pool;
   return options[Math.floor(Math.random() * options.length)];
+}
+
+/** one crayon segment (or dot when from === to) drawn with a soft coat */
+function strokeSeg(
+  ctx: CanvasRenderingContext2D,
+  from: { x: number; y: number },
+  to: { x: number; y: number },
+  color: string
+) {
+  ctx.save();
+  ctx.globalAlpha = BRUSH_ALPHA;
+  ctx.strokeStyle = color;
+  ctx.lineWidth = BRUSH_W;
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  ctx.beginPath();
+  ctx.moveTo(from.x, from.y);
+  // nudge zero-length segments so the round cap still renders a dot
+  ctx.lineTo(to.x === from.x && to.y === from.y ? to.x + 0.01 : to.x, to.y);
+  ctx.stroke();
+  ctx.restore();
+}
+
+type RoundRectPath = Path2D & {
+  roundRect?: (x: number, y: number, w: number, h: number, r: number) => void;
+};
+
+/** parse an SVG `transform` list; every bundled page only uses rotate(a x y) */
+function transformMatrix(t: string): DOMMatrix {
+  try {
+    return new DOMMatrix(t);
+  } catch {
+    // very old WebView without the string constructor: hand-roll rotate()
+    const m = t.match(/rotate\(\s*(-?[\d.]+)(?:\s+(-?[\d.]+)\s+(-?[\d.]+))?\s*\)/);
+    if (!m) return new DOMMatrix();
+    const deg = Number(m[1]);
+    const cx = Number(m[2] ?? 0);
+    const cy = Number(m[3] ?? 0);
+    return new DOMMatrix()
+      .translate(cx, cy)
+      .rotate(deg)
+      .translate(-cx, -cy);
+  }
+}
+
+/** Path2D of one shape in viewBox units (0..400), its SVG transform applied */
+function shapePath(s: ShapeDef): Path2D | null {
+  const a = s.attrs;
+  let p: Path2D;
+  switch (s.el) {
+    case "path":
+      p = new Path2D(String(a.d));
+      break;
+    case "circle":
+      p = new Path2D();
+      p.arc(Number(a.cx), Number(a.cy), Number(a.r), 0, Math.PI * 2);
+      break;
+    case "ellipse":
+      p = new Path2D();
+      p.ellipse(
+        Number(a.cx), Number(a.cy),
+        Number(a.rx), Number(a.ry),
+        0, 0, Math.PI * 2
+      );
+      break;
+    case "rect": {
+      p = new Path2D();
+      const x = Number(a.x), y = Number(a.y);
+      const w = Number(a.width), h = Number(a.height);
+      const r = Number(a.rx) || 0;
+      const rp = p as RoundRectPath;
+      if (r > 0 && typeof rp.roundRect === "function") rp.roundRect(x, y, w, h, r);
+      else p.rect(x, y, w, h);
+      break;
+    }
+    case "polygon": {
+      p = new Path2D();
+      const pts = String(a.points)
+        .split(/[\s,]+/)
+        .filter(Boolean)
+        .map(Number);
+      for (let i = 0; i + 1 < pts.length; i += 2) {
+        if (i === 0) p.moveTo(pts[0], pts[1]);
+        else p.lineTo(pts[i], pts[i + 1]);
+      }
+      p.closePath();
+      break;
+    }
+    default:
+      return null; // "line" decorations are never colorable
+  }
+  const t = typeof a.transform === "string" ? a.transform : undefined;
+  if (!t) return p;
+  const q = new Path2D();
+  q.addPath(p, transformMatrix(t));
+  return q;
+}
+
+interface RegionKit {
+  ids: string[];
+  shapeById: Record<string, ShapeDef>;
+  /** region outline in paint-canvas coords (PAINT_SIZE) */
+  paths: Record<string, Path2D>;
+  /** regions partly UNDER other shapes paint through these alpha masks */
+  masks: Record<string, HTMLCanvasElement>;
+  /** CELL_GRID² grid: index into ids of the topmost region covering each cell (-1 = none) */
+  cellOwner: Int16Array;
+  /** cells owned by each region (parallel to ids) */
+  cellTotals: number[];
+  hit: (x: number, y: number) => string | null;
+}
+
+/**
+ * Precomputes everything the crayon engine needs for one page: scaled region
+ * paths, occlusion masks for underlapping regions (e.g. the sky behind the
+ * bird) and the ownership grid used to measure painting progress.
+ */
+function buildRegionKit(page: { shapes: ShapeDef[] }): RegionKit {
+  const colorables = page.shapes.filter((s) => s.colorable && s.id);
+  const ids: string[] = [];
+  const shapeById: Record<string, ShapeDef> = {};
+  const paths: Record<string, Path2D> = {};
+  const basePaths: Path2D[] = [];
+  for (const s of colorables) {
+    const base = shapePath(s);
+    if (!base) continue;
+    const big = new Path2D();
+    big.addPath(base, new DOMMatrix([2, 0, 0, 2, 0, 0])); // viewBox 400 -> PAINT_SIZE
+    ids.push(s.id as string);
+    shapeById[s.id as string] = s;
+    paths[s.id as string] = big;
+    basePaths.push(big);
+  }
+
+  // rasterize each region on the small grid (document order, so later shapes
+  // overwrite earlier cells = topmost region owns the cell, like SVG painting)
+  const cells = document.createElement("canvas");
+  cells.width = CELL_GRID;
+  cells.height = CELL_GRID;
+  const cctx = cells.getContext("2d", { willReadFrequently: true })!;
+  const presence: Uint8Array[] = [];
+  const k = CELL_GRID / PAINT_SIZE;
+  for (const p of basePaths) {
+    cctx.save();
+    // clear in identity space first — clearRect follows the transform too
+    cctx.setTransform(1, 0, 0, 1, 0, 0);
+    cctx.clearRect(0, 0, CELL_GRID, CELL_GRID);
+    cctx.setTransform(k, 0, 0, k, 0, 0);
+    cctx.fillStyle = "#fff";
+    cctx.fill(p);
+    cctx.restore();
+    const data = cctx.getImageData(0, 0, CELL_GRID, CELL_GRID).data;
+    const pres = new Uint8Array(CELL_GRID * CELL_GRID);
+    for (let i = 0; i < pres.length; i++) pres[i] = data[i * 4 + 3] > 32 ? 1 : 0;
+    presence.push(pres);
+  }
+  const cellOwner = new Int16Array(CELL_GRID * CELL_GRID).fill(-1);
+  for (let i = 0; i < ids.length; i++) {
+    const pres = presence[i];
+    for (let c = 0; c < cellOwner.length; c++) if (pres[c]) cellOwner[c] = i;
+  }
+  const cellTotals = new Array<number>(ids.length).fill(0);
+  for (let c = 0; c < cellOwner.length; c++) {
+    const o = cellOwner[c];
+    if (o >= 0) cellTotals[o]++;
+  }
+
+  // occlusion masks: any region with cells stolen by a shape above it paints
+  // through a mask with those shapes erased, so its color never shows through
+  const masks: Record<string, HTMLCanvasElement> = {};
+  for (let i = 0; i < ids.length; i++) {
+    const underlaps = presence[i].some((v, c) => v && cellOwner[c] !== i);
+    if (!underlaps) continue;
+    const mask = document.createElement("canvas");
+    mask.width = STORE_SIZE;
+    mask.height = STORE_SIZE;
+    const mctx = mask.getContext("2d")!;
+    const mk = STORE_SIZE / PAINT_SIZE;
+    mctx.setTransform(mk, 0, 0, mk, 0, 0);
+    mctx.fillStyle = "#fff";
+    mctx.fill(basePaths[i]);
+    mctx.globalCompositeOperation = "destination-out";
+    for (let j = i + 1; j < basePaths.length; j++) mctx.fill(basePaths[j]);
+    masks[ids[i]] = mask;
+  }
+
+  // dedicated 1×1 context purely for geometric hit-testing (identity transform)
+  const hitCtx = document.createElement("canvas").getContext("2d")!;
+  const hit = (x: number, y: number) => {
+    for (let i = ids.length - 1; i >= 0; i--) {
+      if (hitCtx.isPointInPath(paths[ids[i]], x, y)) return ids[i];
+    }
+    return null;
+  };
+
+  return { ids, shapeById, paths, masks, cellOwner, cellTotals, hit };
+}
+
+/** one finger's crayon stroke */
+interface StrokeState {
+  /** last sampled client position */
+  x: number;
+  y: number;
+  /** last painted canvas point, for continuous segments */
+  lastPt: { x: number; y: number } | null;
+  /** regionId -> crayon color chosen for this stroke (magic rainbow mode) */
+  colors: Map<string, string>;
+  /** color of the pencil cursor */
+  color: string;
 }
 
 /* ---------------------------------- hint ----------------------------------- */
@@ -124,12 +354,26 @@ function HintPill({ text }: { text: string }) {
 
 /* ---------------------------------- app ------------------------------------ */
 
-const STORE_KEY = "yuk-mewarnai-v1";
+/** saved crayon work per page: a downscaled PNG snapshot + completed regions */
+interface PaintSave {
+  img: string | null;
+  done: string[];
+}
+type PaintStore = Record<string, PaintSave>;
 
-function loadStore(): { fills?: Record<string, Record<string, string>>; draw?: string | null } {
+const STORE_KEY = "yuk-mewarnai-v2";
+const LEGACY_STORE_KEY = "yuk-mewarnai-v1";
+
+function loadStore(): { paints?: PaintStore; draw?: string | null } {
   if (typeof window === "undefined") return {};
   try {
-    return JSON.parse(window.localStorage.getItem(STORE_KEY) ?? "{}");
+    const raw = window.localStorage.getItem(STORE_KEY);
+    if (raw) return JSON.parse(raw);
+    // migrate from the v1 instant-fill store: keep the free-draw picture,
+    // the old solid region fills are obsolete under the crayon engine
+    const legacy = window.localStorage.getItem(LEGACY_STORE_KEY);
+    if (legacy) return { draw: (JSON.parse(legacy)?.draw as string | null) ?? null };
+    return {};
   } catch {
     return {};
   }
@@ -138,11 +382,9 @@ function loadStore(): { fills?: Record<string, Record<string, string>>; draw?: s
 export function DrawingApp({ onExit }: { onExit?: () => void }) {
   const [view, setView] = useState<View>("gallery");
   const [pageIndex, setPageIndex] = useState(0);
-  const [allFills, setAllFills] = useState<Record<string, Record<string, string>>>(
-    () => loadStore().fills ?? {}
-  );
-  const allFillsRef = useRef(allFills);
-  const [undoStack, setUndoStack] = useState<Record<string, string>[]>([]);
+  const [paints, setPaints] = useState<PaintStore>(() => loadStore().paints ?? {});
+  const paintsRef = useRef(paints);
+  const [undoStack, setUndoStack] = useState<PaintSave[]>([]);
   const [muted, setMutedUi] = useState(false);
   /** pencil color picked from the palette box; null = magic rainbow mode */
   const [pickedColor, setPickedColor] = useState<string | null>(null);
@@ -156,11 +398,13 @@ export function DrawingApp({ onExit }: { onExit?: () => void }) {
   const celebratedRef = useRef<string | null>(null);
   const celebrateTimer = useRef<number | null>(null);
 
-  // rubbing state (multi-touch: one stroke per finger)
+  // crayon painting state (multi-touch: one stroke per finger)
   const svgWrapRef = useRef<HTMLDivElement>(null);
-  const strokePointers = useRef<
-    Map<number, { x: number; y: number; colored: Set<string>; color: string }>
-  >(new Map());
+  const paintRef = useRef<HTMLCanvasElement>(null);
+  const scratchRef = useRef<HTMLCanvasElement | null>(null);
+  const kitRef = useRef<RegionKit | null>(null);
+  const doneRef = useRef<Set<string>>(new Set());
+  const strokePointers = useRef<Map<number, StrokeState>>(new Map());
   const gestureSnapped = useRef(false);
   const lastBuzz = useRef(0);
 
@@ -178,13 +422,13 @@ export function DrawingApp({ onExit }: { onExit?: () => void }) {
   const snapshots = useRef<string[]>([]);
   const savedDraw = useRef<string | null>(loadStore().draw ?? null);
 
-  /** persist coloring fills + free-draw canvas so a reload never destroys the child's work */
+  /** persist crayon paintings + free-draw canvas so a reload never destroys the child's work */
   const persist = useCallback((drawData?: string | null) => {
     try {
       const draw = drawData !== undefined ? drawData : savedDraw.current;
       window.localStorage.setItem(
         STORE_KEY,
-        JSON.stringify({ fills: allFillsRef.current, draw })
+        JSON.stringify({ paints: paintsRef.current, draw })
       );
     } catch {
       /* storage full or unavailable: ignore */
@@ -192,20 +436,32 @@ export function DrawingApp({ onExit }: { onExit?: () => void }) {
   }, []);
 
   useEffect(() => {
-    allFillsRef.current = allFills;
+    paintsRef.current = paints;
     persist();
-  }, [allFills, persist]);
+  }, [paints, persist]);
 
   const page = COLORING_PAGES[pageIndex];
-  const fills = allFills[page.id] ?? {};
 
-  /** id -> shape lookup for rub hit-testing */
-  const regionMap = useMemo(() => {
-    const m = new Map<string, ShapeDef>();
-    for (const s of page.shapes) if (s.colorable && s.id) m.set(s.id, s);
-    return m;
-  }, [page]);
-  const totalRegions = regionMap.size;
+  /** (re)initialize the crayon canvas when a coloring page is opened */
+  useEffect(() => {
+    if (view !== "color" || !paintRef.current) return;
+    const c = paintRef.current;
+    if (c.width !== PAINT_SIZE) {
+      c.width = PAINT_SIZE;
+      c.height = PAINT_SIZE;
+    } else {
+      c.getContext("2d")?.clearRect(0, 0, PAINT_SIZE, PAINT_SIZE);
+    }
+    kitRef.current = null; // rebuild paths for the new page lazily
+    const saved = paintsRef.current[page.id];
+    doneRef.current = new Set(saved?.done ?? []);
+    if (saved?.img) {
+      const ctx = c.getContext("2d");
+      const img = new Image();
+      img.onload = () => ctx?.drawImage(img, 0, 0, PAINT_SIZE, PAINT_SIZE);
+      img.src = saved.img;
+    }
+  }, [view, pageIndex, page.id]);
 
   /* ------------------------------- celebration ------------------------------ */
 
@@ -222,10 +478,10 @@ export function DrawingApp({ onExit }: { onExit?: () => void }) {
 
   const openColoring = (i: number) => {
     const target = COLORING_PAGES[i];
-    const colored = Object.keys(allFillsRef.current[target.id] ?? {}).length;
+    const done = paintsRef.current[target.id]?.done.length ?? 0;
     const total = target.shapes.filter((s) => s.colorable && s.id).length;
     // a picture that is already complete celebrates silently (no confetti on open)
-    celebratedRef.current = colored >= total ? target.id : null;
+    celebratedRef.current = done >= total && total > 0 ? target.id : null;
     setPageIndex(i);
     setUndoStack([]);
     setView("color");
@@ -277,82 +533,202 @@ export function DrawingApp({ onExit }: { onExit?: () => void }) {
     []
   );
 
-  /* --------------------------- rub-to-color engine -------------------------- */
+  /* ----------------------------- crayon engine ------------------------------- */
 
-  /** Color the region under a point (once per stroke per region). */
-  const fillRegionAt = useCallback(
-    (clientX: number, clientY: number, stroke: Set<string>) => {
-      const hit = document.elementFromPoint(clientX, clientY);
-      const region = hit?.closest("[data-region]");
-      const shapeId = region?.getAttribute("data-region");
-      if (!shapeId || stroke.has(shapeId)) return null;
-      stroke.add(shapeId);
+  /** lazily build (and cache) the region kit for the current page */
+  const getKit = useCallback(() => {
+    if (!kitRef.current) kitRef.current = buildRegionKit(page);
+    return kitRef.current;
+  }, [page]);
 
-      const shape = regionMap.get(shapeId);
-      const palette = shape?.bg ? BG_COLORS : KID_COLORS;
-      const prevFills = allFillsRef.current[page.id] ?? {};
-      // a picked color paints every rubbed area; magic mode pops random colors
-      const paint = pickedColor ?? pickRandom(palette, prevFills[shapeId]);
-      const nextFills = { ...prevFills, [shapeId]: paint };
+  /** reusable scratch surface for painting through occlusion masks */
+  const ensureScratch = () => {
+    if (!scratchRef.current) {
+      const s = document.createElement("canvas");
+      s.width = PAINT_SIZE;
+      s.height = PAINT_SIZE;
+      scratchRef.current = s;
+    }
+    return scratchRef.current;
+  };
 
-      // one undo snapshot per rubbing gesture (even with many fingers)
-      if (!gestureSnapped.current) {
-        gestureSnapped.current = true;
-        setUndoStack((prev) => [...prev.slice(-24), { ...prevFills }]);
+  /** client coords -> paint-canvas coords */
+  const clientToPaint = (clientX: number, clientY: number) => {
+    const rect = svgWrapRef.current?.getBoundingClientRect();
+    if (!rect) return null;
+    return {
+      x: ((clientX - rect.left) / rect.width) * PAINT_SIZE,
+      y: ((clientY - rect.top) / rect.height) * PAINT_SIZE,
+    };
+  };
+
+  /** gentle haptic buzz, throttled (not every dab) */
+  const buzz = () => {
+    const now = Date.now();
+    if (now - lastBuzz.current > 90 && typeof navigator !== "undefined") {
+      lastBuzz.current = now;
+      try {
+        navigator.vibrate?.(12);
+      } catch {
+        /* vibration not supported */
       }
+    }
+  };
 
-      // keep the ref fresh synchronously so rapid rubs in one batch stay correct
-      allFillsRef.current = { ...allFillsRef.current, [page.id]: nextFills };
-      setAllFills(allFillsRef.current);
+  /** downscaled PNG of the current paint canvas (undo + localStorage) */
+  const snapshotPaint = (): string | null => {
+    const c = paintRef.current;
+    if (!c) return null;
+    const t = document.createElement("canvas");
+    t.width = STORE_SIZE;
+    t.height = STORE_SIZE;
+    const tctx = t.getContext("2d");
+    if (!tctx) return null;
+    tctx.drawImage(c, 0, 0, STORE_SIZE, STORE_SIZE);
+    return t.toDataURL("image/png");
+  };
 
-      // rising "musical scale" pops while the sweep colors more areas
-      popSound(0.72 + (stroke.size % 9) * 0.11 + Math.random() * 0.05);
-      addSparkle(clientX, clientY, paint);
+  /** remember the pre-gesture state once per gesture for undo */
+  const ensureGestureSnapshot = () => {
+    if (gestureSnapped.current) return;
+    gestureSnapped.current = true;
+    setUndoStack((prev) => [
+      ...prev.slice(-(UNDO_LIMIT - 1)),
+      { img: snapshotPaint(), done: [...doneRef.current] },
+    ]);
+  };
 
-      // confetti party when EVERY area of the picture just got colored
-      if (
-        !(shapeId in prevFills) &&
-        Object.keys(nextFills).length >= totalRegions &&
-        celebratedRef.current !== page.id
-      ) {
-        celebratedRef.current = page.id;
-        tadaSound();
-        showCelebrate("Semua area sudah berwarna!");
+  /** one crayon segment, clipped inside its region (or masked for underlaps) */
+  const crayonDab = useCallback(
+    (
+      from: { x: number; y: number },
+      to: { x: number; y: number },
+      regionId: string,
+      color: string
+    ) => {
+      const ctx = paintRef.current?.getContext("2d");
+      const kit = getKit();
+      if (!ctx) return;
+      const mask = kit.masks[regionId];
+      if (mask) {
+        // region sits partly under other shapes: stroke on a scratch layer,
+        // keep only stroke ∩ mask, then stamp it onto the paint canvas
+        const sctx = ensureScratch().getContext("2d");
+        if (!sctx) return;
+        sctx.setTransform(1, 0, 0, 1, 0, 0);
+        sctx.globalCompositeOperation = "source-over";
+        sctx.clearRect(0, 0, PAINT_SIZE, PAINT_SIZE);
+        strokeSeg(sctx, from, to, color);
+        sctx.globalCompositeOperation = "destination-in";
+        sctx.setTransform(2, 0, 0, 2, 0, 0); // mask canvas is STORE_SIZE
+        sctx.drawImage(mask, 0, 0);
+        sctx.setTransform(1, 0, 0, 1, 0, 0);
+        sctx.globalCompositeOperation = "source-over";
+        ctx.drawImage(scratchRef.current as HTMLCanvasElement, 0, 0);
+      } else {
+        ctx.save();
+        ctx.clip(kit.paths[regionId]);
+        strokeSeg(ctx, from, to, color);
+        ctx.restore();
       }
-
-      // gentle haptic buzz, throttled (not every fill)
-      const now = Date.now();
-      if (now - lastBuzz.current > 90 && typeof navigator !== "undefined") {
-        lastBuzz.current = now;
-        try {
-          navigator.vibrate?.(12);
-        } catch {
-          /* vibration not supported */
-        }
-      }
-      setHintRubDone(true);
-      return paint;
     },
-    [addSparkle, page.id, pickedColor, regionMap, showCelebrate, totalRegions]
+    [getKit]
   );
 
+  /**
+   * Look up the region under a paint-canvas point and pick this stroke's
+   * crayon color for it. Returns null over gaps between regions.
+   */
+  const paintAt = useCallback(
+    (x: number, y: number, stroke: StrokeState) => {
+      const kit = getKit();
+      const id = kit.hit(x, y);
+      if (!id) return null;
+      const existing = stroke.colors.get(id);
+      if (existing) return { id, color: existing, isNew: false };
+      // a picked color paints every rubbed area; magic mode pops random colors
+      const palette = kit.shapeById[id]?.bg ? BG_COLORS : KID_COLORS;
+      const color = pickedColor ?? pickRandom(palette);
+      stroke.colors.set(id, color);
+      // rising "musical scale" pops while the sweep colors more areas
+      popSound(0.72 + (stroke.colors.size % 9) * 0.11 + Math.random() * 0.05);
+      return { id, color, isNew: true };
+    },
+    [getKit, pickedColor]
+  );
+
+  /** measure real paint coverage, mark regions complete, persist the canvas */
+  const finishGesture = useCallback(() => {
+    gestureSnapped.current = false;
+    const c = paintRef.current;
+    const ctx = c?.getContext("2d");
+    const kit = getKit();
+    if (!c || !ctx) return;
+
+    // count painted cells per region on a downscaled copy of the canvas
+    const grid = document.createElement("canvas");
+    grid.width = CELL_GRID;
+    grid.height = CELL_GRID;
+    const gctx = grid.getContext("2d", { willReadFrequently: true });
+    if (!gctx) return;
+    gctx.drawImage(c, 0, 0, CELL_GRID, CELL_GRID);
+    const data = gctx.getImageData(0, 0, CELL_GRID, CELL_GRID).data;
+    const counts = new Array<number>(kit.ids.length).fill(0);
+    for (let i = 0; i < kit.cellOwner.length; i++) {
+      const o = kit.cellOwner[i];
+      if (o >= 0 && data[i * 4 + 3] > 48) counts[o]++;
+    }
+    let newlyDone = 0;
+    kit.ids.forEach((id, i) => {
+      if (doneRef.current.has(id)) return;
+      if (kit.cellTotals[i] > 0 && counts[i] >= kit.cellTotals[i] * DONE_RATIO) {
+        doneRef.current.add(id);
+        newlyDone++;
+      }
+    });
+    if (newlyDone > 0) popSound(1.5);
+
+    const save: PaintSave = { img: snapshotPaint(), done: [...doneRef.current] };
+    paintsRef.current = { ...paintsRef.current, [page.id]: save };
+    setPaints(paintsRef.current);
+
+    // confetti party when EVERY area of the picture just got colored
+    if (
+      save.done.length >= kit.ids.length &&
+      kit.ids.length > 0 &&
+      celebratedRef.current !== page.id
+    ) {
+      celebratedRef.current = page.id;
+      tadaSound();
+      showCelebrate("Semua area sudah berwarna!");
+    }
+  }, [getKit, page.id, showCelebrate]);
+
   const onRubDown = (e: React.PointerEvent<HTMLDivElement>) => {
-    const stroke = new Set<string>();
-    const startColor = pickedColor ?? pickRandom(KID_COLORS);
-    strokePointers.current.set(e.pointerId, {
+    const stroke: StrokeState = {
       x: e.clientX,
       y: e.clientY,
-      colored: stroke,
-      color: startColor,
-    });
-    // an instant tap already colors the area under the finger
-    const paint = fillRegionAt(e.clientX, e.clientY, stroke);
-    const color = paint ?? startColor;
-    const p = strokePointers.current.get(e.pointerId);
-    if (p) p.color = color;
-    rubIdleColor.current = color;
+      lastPt: null,
+      colors: new Map(),
+      color: pickedColor ?? pickRandom(KID_COLORS),
+    };
+    strokePointers.current.set(e.pointerId, stroke);
+    // pressing the pencil down leaves the first soft crayon dot
+    const p = clientToPaint(e.clientX, e.clientY);
+    if (p) {
+      const r = paintAt(p.x, p.y, stroke);
+      if (r) {
+        ensureGestureSnapshot();
+        crayonDab(p, p, r.id, r.color);
+        stroke.color = r.color;
+        addSparkle(e.clientX, e.clientY, r.color);
+        buzz();
+      }
+    }
+    rubIdleColor.current = stroke.color;
     // a colored pencil appears under the finger straight away
-    rubCursorRef.current?.show(e.pointerId, e.clientX, e.clientY, "pencil", color);
+    rubCursorRef.current?.show(e.pointerId, e.clientX, e.clientY, "pencil", stroke.color);
+    setHintRubDone(true);
   };
 
   const onRubMove = (e: React.PointerEvent<HTMLDivElement>) => {
@@ -380,48 +756,71 @@ export function DrawingApp({ onExit }: { onExit?: () => void }) {
       ? native.getCoalescedEvents()
       : [native];
 
-    let lastPaint: string | null = null;
     for (const pt of points) {
       const dx = pt.clientX - p.x;
       const dy = pt.clientY - p.y;
       const dist = Math.hypot(dx, dy);
       if (dist < 1) continue;
-      // sample along the segment so fast swipes never skip an area
+      // sample along the segment so the crayon lays down a continuous coat
       const steps = Math.min(Math.max(1, Math.ceil(dist / RUB_STEP)), 40);
       for (let i = 1; i <= steps; i++) {
-        const paint = fillRegionAt(
-          p.x + (dx * i) / steps,
-          p.y + (dy * i) / steps,
-          p.colored
-        );
-        if (paint) lastPaint = paint;
+        const cx = p.x + (dx * i) / steps;
+        const cy = p.y + (dy * i) / steps;
+        const cp = clientToPaint(cx, cy);
+        if (!cp) continue;
+        const r = paintAt(cp.x, cp.y, p);
+        if (!r) {
+          p.lastPt = cp; // keep gliding; clipping leaves the gaps unpainted
+          continue;
+        }
+        ensureGestureSnapshot();
+        crayonDab(p.lastPt ?? cp, cp, r.id, r.color);
+        p.lastPt = cp;
+        p.color = r.color;
+        if (r.isNew) {
+          addSparkle(cx, cy, r.color);
+          buzz();
+        }
       }
       p.x = pt.clientX;
       p.y = pt.clientY;
     }
 
     // the pencil takes on the color of the area it just painted
-    if (lastPaint) {
-      p.color = lastPaint;
-      rubIdleColor.current = lastPaint;
-    }
+    rubIdleColor.current = p.color;
     rubCursorRef.current?.show(e.pointerId, e.clientX, e.clientY, "pencil", p.color);
   };
 
   const onRubUp = (e: React.PointerEvent<HTMLDivElement>) => {
     strokePointers.current.delete(e.pointerId);
     rubCursorRef.current?.hide(e.pointerId);
-    if (strokePointers.current.size === 0) gestureSnapped.current = false;
+    if (strokePointers.current.size === 0) finishGesture();
   };
 
   /* ------------------------------ coloring tools ---------------------------- */
+
+  /** redraw the paint canvas + completion set from a snapshot */
+  const restorePaint = (save: PaintSave) => {
+    const ctx = paintRef.current?.getContext("2d");
+    if (!ctx) return;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, PAINT_SIZE, PAINT_SIZE);
+    doneRef.current = new Set(save.done);
+    if (save.img) {
+      const img = new Image();
+      img.onload = () => ctx.drawImage(img, 0, 0, PAINT_SIZE, PAINT_SIZE);
+      img.src = save.img;
+    }
+    paintsRef.current = { ...paintsRef.current, [page.id]: save };
+    setPaints(paintsRef.current);
+  };
 
   const undoColoring = () => {
     celebratedRef.current = null; // allow the confetti party again
     setUndoStack((prev) => {
       const last = prev[prev.length - 1];
       if (last) {
-        setAllFills((f) => ({ ...f, [page.id]: last }));
+        restorePaint(last);
         undoSound();
       }
       return prev.slice(0, -1);
@@ -430,8 +829,11 @@ export function DrawingApp({ onExit }: { onExit?: () => void }) {
 
   const resetColoring = () => {
     celebratedRef.current = null; // allow the confetti party again
-    setUndoStack((prev) => [...prev.slice(-24), { ...fills }]);
-    setAllFills((prev) => ({ ...prev, [page.id]: {} }));
+    setUndoStack((prev) => [
+      ...prev.slice(-(UNDO_LIMIT - 1)),
+      { img: snapshotPaint(), done: [...doneRef.current] },
+    ]);
+    restorePaint({ img: null, done: [] });
     undoSound();
   };
 
@@ -448,7 +850,18 @@ export function DrawingApp({ onExit }: { onExit?: () => void }) {
 
   const saveColoring = () => {
     const svg = svgWrapRef.current?.querySelector("svg");
-    if (!svg) return;
+    const paint = paintRef.current;
+    if (!svg || !paint) return;
+    const c = document.createElement("canvas");
+    c.width = 1000;
+    c.height = 1000;
+    const ctx = c.getContext("2d");
+    if (!ctx) return;
+    // the crayon coats first, then the hollow outlines are stamped on top
+    ctx.fillStyle = "#FFFFFF";
+    ctx.fillRect(0, 0, 1000, 1000);
+    ctx.drawImage(paint, 0, 0, 1000, 1000);
+    const crayonOnly = c.toDataURL("image/png");
     const clone = svg.cloneNode(true) as SVGSVGElement;
     clone.setAttribute("xmlns", "http://www.w3.org/2000/svg");
     clone.setAttribute("width", "1000");
@@ -457,17 +870,10 @@ export function DrawingApp({ onExit }: { onExit?: () => void }) {
     const url = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(data)}`;
     const img = new Image();
     img.onload = () => {
-      const c = document.createElement("canvas");
-      c.width = 1000;
-      c.height = 1000;
-      const ctx = c.getContext("2d");
-      if (!ctx) return;
-      ctx.fillStyle = "#FFFFFF";
-      ctx.fillRect(0, 0, 1000, 1000);
       ctx.drawImage(img, 0, 0, 1000, 1000);
       celebrateDownload(c.toDataURL("image/png"), `yuk-mewarnai-${page.id}.png`);
     };
-    img.onerror = () => celebrateDownload(url, `yuk-mewarnai-${page.id}.svg`);
+    img.onerror = () => celebrateDownload(crayonOnly, `yuk-mewarnai-${page.id}.png`);
     img.src = url;
   };
 
@@ -847,6 +1253,9 @@ export function DrawingApp({ onExit }: { onExit?: () => void }) {
         </main>
       ) : (
         <main className="flex min-h-0 flex-1 flex-col gap-2 p-3">
+          {/* palette lives ABOVE the paper: little fingers sliding off the
+              bottom of the picture can never press a color by accident */}
+          <ColorPalette colors={KID_COLORS} value={pickedColor} onChange={pickColor} />
           <div className="grid min-h-0 flex-1 place-items-center">
             <div
               ref={svgWrapRef}
@@ -861,15 +1270,26 @@ export function DrawingApp({ onExit }: { onExit?: () => void }) {
               aria-label={`Area mewarnai ${page.name}, gesek jari untuk mewarnai`}
               role="img"
             >
-              <ColoringSvg page={page} fills={fills} className="block h-full w-full" />
+              {/* the crayon paint lives under the hollow outlines */}
+              <canvas
+                ref={paintRef}
+                width={PAINT_SIZE}
+                height={PAINT_SIZE}
+                className="absolute inset-0 h-full w-full"
+                aria-hidden="true"
+              />
+              <ColoringSvg
+                page={page}
+                outlineOnly
+                className="relative block h-full w-full"
+              />
               <PencilLayer ref={rubCursorRef} />
               <SparkleLayer bursts={bursts} />
-              <AnimatePresence>
-                {!hintRubDone && <HintPill key="hint-rub" text="Gesek-gesek untuk mewarnai!" />}
-              </AnimatePresence>
+            <AnimatePresence>
+              {!hintRubDone && <HintPill key="hint-rub" text="Gesek-gesek untuk mewarnai!" />}
+            </AnimatePresence>
             </div>
           </div>
-          <ColorPalette colors={KID_COLORS} value={pickedColor} onChange={pickColor} />
         </main>
       )}
 
