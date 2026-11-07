@@ -31,6 +31,12 @@ Releases** (tanpa Play Store).
 ## Alur rilis (GitHub, tanpa Play Store)
 
 1. **Sekali saja — siapkan repo & signing:**
+   > ✅ Sudah selesai dikonfigurasi untuk repo `ardani17/game-alesha`:
+   > keystore tersimpan di `../gamealesha-keystore/` (di LUAR repo, berisi
+   > `gamealesha.keystore` + `KREDENSIAL.txt` — **backup ke tempat aman!**)
+   > dan 4 GitHub Secrets sudah terpasang. Rilis v1.0.1+ otomatis
+   > release-signed. Abaikan langkah di bawah bila tidak mulai dari nol.
+
    ```bash
    git init && git add . && git commit -m "Game Alesha"
    gh repo create gamealesha --private --source=. --push   # atau buat manual di GitHub
