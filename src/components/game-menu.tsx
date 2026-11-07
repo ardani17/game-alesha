@@ -235,7 +235,11 @@ export function GameMenu({ onPick }: { onPick: (game: MenuPick) => void }) {
         </p>
       </header>
 
-      <main className="relative mx-auto flex w-full max-w-3xl flex-1 flex-col justify-center overflow-y-auto px-4 pb-10 pt-6">
+      <main className="relative mx-auto flex w-full max-w-3xl flex-1 min-h-0 flex-col overflow-y-auto px-4 pb-10 pt-6">
+        {/* my-auto: memusatkan saat muat, otomatis 0 saat meluber agar rata
+            atas dan seluruh isi dapat digulir (justify-center akan memotong
+            bagian atas konten yang tak terjangkau oleh scrollTop) */}
+        <div className="my-auto flex w-full flex-col">
         <div className="grid grid-cols-2 gap-4">
           {/* Menggambar (existing coloring & free-draw game) */}
           <motion.button
@@ -497,6 +501,7 @@ export function GameMenu({ onPick }: { onPick: (game: MenuPick) => void }) {
               </div>
             </div>
           )}
+        </div>
         </div>
       </main>
     </div>
