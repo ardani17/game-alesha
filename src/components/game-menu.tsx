@@ -356,11 +356,11 @@ export function GameMenu({ onPick }: { onPick: (game: MenuPick) => void }) {
           >
             <div className="grid aspect-square place-items-center rounded-2xl bg-white/35 p-3">
               <div className="flex flex-col items-center gap-1.5">
-                <div className="flex gap-1">
+                <div className="flex flex-wrap justify-center gap-1">
                   {["A", "P", "E", "L"].map((ch, i) => (
                     <span
                       key={i}
-                      className="grid h-8 w-8 place-items-center rounded-lg bg-white/90 text-base font-extrabold shadow-sm"
+                      className="grid h-5 w-5 place-items-center rounded-md bg-white/90 text-[11px] font-extrabold shadow-sm sm:h-8 sm:w-8 sm:rounded-lg sm:text-base"
                       style={{ color: LETTER_COLORS[i % LETTER_COLORS.length] }}
                     >
                       {ch}
