@@ -1,0 +1,103 @@
+# Rilis APK otomatis ke GitHub Releases.
+#
+# Cara pakai:
+#   git tag v1.0.0 && git push origin v1.0.0
+# -> build APK, lalu terunggah ke GitHub Releases (draft).
+#
+# Signing (disarankan agar update menimpa instalasi lama tanpa uninstall):
+#   1. Buat keystore sekali:
+#      keytool -genkey -v -keystore gamealesha.keystore -alias gamealesha \
+#        -keyalg RSA -keysize 2048 -validity 10000
+#   2. Base64:  base64 -w0 gamealesha.keystore   (Windows Git Bash)
+#   3. Tambahkan Secrets di GitHub (Settings > Secrets and variables > Actions):
+#      ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD,
+#      ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD
+# Tanpa secrets, workflow membuat APK debug (bisa diinstall, tapi tiap rilis
+# beda tanda tangan -> update perlu uninstall dulu).
+name: Rilis APK
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Install dependensi
+        run: npm ci
+
+      - name: Build web (static export) + service worker
+        run: npm run build
+
+      - name: Sinkronkan ke project Android
+        run: npx cap sync android
+
+      - name: Siapkan signing (bila secrets tersedia)
+        id: signing
+        env:
+          KS: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        if: ${{ env.KS != '' }}
+        run: |
+          echo "$KS" | base64 -d > android/app/release.keystore
+          cat > android/app/release-signing.gradle <<'EOF'
+          android {
+            signingConfigs {
+              release {
+                storeFile file("release.keystore")
+                storePassword System.getenv("STORE_PASS")
+                keyAlias System.getenv("KEY_ALIAS")
+                keyPassword System.getenv("KEY_PASS")
+              }
+            }
+            buildTypes {
+              release {
+                signingConfig signingConfigs.release
+              }
+            }
+          }
+          EOF
+          echo "apply from: 'release-signing.gradle'" >> android/app/build.gradle
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+
+      - name: Build APK release (signed)
+        if: steps.signing.outputs.ok == 'true'
+        env:
+          STORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleRelease
+
+      - name: Build APK debug (fallback tanpa signing)
+        if: steps.signing.outputs.ok != 'true'
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug
+          mv app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/release/app-release.apk
+
+      - name: Unggah APK ke GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          files: android/app/build/outputs/apk/release/app-release.apk

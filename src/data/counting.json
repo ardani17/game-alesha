@@ -1,0 +1,12 @@
+[
+  { "name": "apel", "emojis": ["🍎", "🍏"] },
+  { "name": "bintang", "emojis": ["⭐", "🌟"] },
+  { "name": "bebek", "emojis": ["🦆", "🐤"] },
+  { "name": "balon", "emojis": ["🎈", "🎀"] },
+  { "name": "ikan", "emojis": ["🐟", "🐠"] },
+  { "name": "bunga", "emojis": ["🌸", "🌻"] },
+  { "name": "mobil", "emojis": ["🚗", "🚙"] },
+  { "name": "beruang", "emojis": ["🐻", "🐼"] },
+  { "name": "pisang", "emojis": ["🍌"] },
+  { "name": "kue", "emojis": ["🧁", "🍰"] }
+]

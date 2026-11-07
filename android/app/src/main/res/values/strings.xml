@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Game Alesha</string>
+    <string name="title_activity_main">Game Alesha</string>
+    <string name="package_name">com.ardani.gamealesha</string>
+    <string name="custom_url_scheme">com.ardani.gamealesha</string>
+</resources>
